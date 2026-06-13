@@ -8,6 +8,7 @@ import os
 from database import init_db, get_session, Trade, Position, DailyStats
 from bot import fetch_all_tickers, fetch_ohlcv, TradingBot, SUPPORTED_PAIRS, TRADING_MODE, get_paper_balance
 from strategies import STRATEGIES
+from arbitrage import scan_all_triangles, execute_paper_arb
 
 # ─────────────────────────────────────────────
 #  Page Config
@@ -68,7 +69,7 @@ with st.sidebar:
     st.markdown("### Run a Strategy")
     selected_symbol   = st.selectbox("Asset", SUPPORTED_PAIRS)
     selected_strategy = st.selectbox("Strategy", list(STRATEGIES.keys()))
-    selected_timeframe = st.selectbox("Timeframe", ["15m", "1h", "4h", "1d"])
+    selected_timeframe = st.selectbox("Timeframe", ["1m", "3m", "15m", "1h", "4h", "1d"])
 
     if st.button("▶ Run Once", use_container_width=True, type="primary"):
         with st.spinner("Running strategy..."):
@@ -141,7 +142,7 @@ st.divider()
 # ─────────────────────────────────────────────
 #  Tabs
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["📡 Live Prices", "📂 Open Positions", "📜 Trade History", "📊 Performance"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📡 Live Prices", "📂 Open Positions", "📜 Trade History", "📊 Performance", "🔁 Arbitrage"])
 
 # ── Tab 1: Live Prices ──────────────────────
 with tab1:
@@ -158,7 +159,7 @@ with tab1:
     st.divider()
     st.markdown("### Price Chart")
     chart_symbol    = st.selectbox("Select asset", SUPPORTED_PAIRS, key="chart_symbol")
-    chart_timeframe = st.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], key="chart_tf")
+    chart_timeframe = st.selectbox("Timeframe", ["1m", "3m", "15m", "1h", "4h", "1d"], key="chart_tf")
 
     with st.spinner("Loading chart..."):
         try:
@@ -315,5 +316,72 @@ with tab4:
                     "Win Rate":      f"{wr:.1f}%",
                 })
             st.dataframe(pd.DataFrame(rows2), use_container_width=True, hide_index=True)
+
+# ── Tab 5: Arbitrage ──────────────────────
+with tab5:
+    st.markdown("### 🔁 Triangular Arbitrage Scanner")
+    st.caption("Scans BTC/ETH/BNB/SOL triangles on Binance for profit opportunities after fees (0.3% total)")
+
+    col_scan, col_size = st.columns([2, 1])
+    with col_size:
+        trade_size = st.number_input("Trade size (USDT)", min_value=10.0, max_value=10000.0, value=100.0, step=10.0)
+    with col_scan:
+        scan_clicked = st.button("🔍 Scan Now", type="primary", use_container_width=True)
+
+    if scan_clicked:
+        with st.spinner("Scanning all triangles... this takes ~5 seconds"):
+            results = scan_all_triangles()
+
+        st.markdown("#### Scan Results")
+        for r in results:
+            profit_pct = r.get("profit_pct", 0)
+            triangle   = r.get("triangle", "")
+            profit_abs = r.get("profit_abs", 0) * (trade_size / 1000)
+            is_profit  = r.get("profitable", False)
+
+            if is_profit:
+                st.success(f"✅ **{triangle}** | Profit: **{profit_pct:+.4f}%** (≈ ${profit_abs:+.4f} on ${trade_size})")
+            else:
+                st.info(f"➖ {triangle} | {profit_pct:+.4f}%")
+
+        # Show best opportunity
+        best = results[0] if results else None
+        if best and best.get("profitable"):
+            st.divider()
+            st.markdown("#### 🎯 Best Opportunity")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Triangle",   best["triangle"].split(" → ")[0] + " →...")
+            c2.metric("Profit %",   f"{best['profit_pct']:+.4f}%")
+            c3.metric("Est. Profit", f"${(best['profit_abs'] * trade_size / 1000):+.4f}")
+
+            st.markdown("**Prices used:**")
+            for pair, price in best["prices"].items():
+                st.code(f"{pair}: {price}")
+
+            if st.button("⚡ Execute Paper Trade", type="primary"):
+                exec_result = execute_paper_arb(best, trade_size_usdt=trade_size)
+                if exec_result["success"]:
+                    st.success(f"✅ Paper trade executed! Profit: ${exec_result['profit']:+.4f}")
+                else:
+                    st.error(f"❌ Error: {exec_result.get('error')}")
+        elif results:
+            st.warning("⚠️ No profitable opportunities found right now. Try scanning again in a few seconds.")
+
+    st.divider()
+    st.markdown("#### Recent Arbitrage Trades")
+    arb_trades = session.query(Trade).filter_by(strategy="Triangular Arbitrage").order_by(Trade.timestamp.desc()).limit(20).all()
+    if not arb_trades:
+        st.info("No arbitrage trades executed yet. Run a scan and execute a paper trade above.")
+    else:
+        rows = []
+        for t in arb_trades:
+            rows.append({
+                "Time":    t.timestamp.strftime("%Y-%m-%d %H:%M:%S") if t.timestamp else "—",
+                "Route":   t.symbol,
+                "Side":    t.side.upper(),
+                "PnL":     f"${t.pnl:+.4f}",
+                "Mode":    t.mode.upper(),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 session.close()
