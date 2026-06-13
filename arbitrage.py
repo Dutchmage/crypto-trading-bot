@@ -1,16 +1,17 @@
 import time
+import threading
 import ccxt
 from datetime import datetime
-from database import get_session, Trade, DailyStats, init_db
+from database import get_session, Trade, init_db
 import os
 
 TRADING_MODE  = os.getenv("TRADING_MODE", "paper")
 API_KEY       = os.getenv("BINANCE_API_KEY", "")
 API_SECRET    = os.getenv("BINANCE_SECRET_KEY", "")
-PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "10000.0"))
-TRADE_FEE     = 0.001  # 0.1% per trade, 0.3% total for 3 legs
+TRADE_FEE     = 0.001   # 0.1% per trade × 3 legs = 0.3% total
+SCAN_INTERVAL = 10      # seconds between scans
+MIN_PROFIT_PCT = 0.1    # minimum profit % to execute
 
-# Triangles to scan: (base, mid, quote) — all routed through USDT
 TRIANGLES = [
     ("BTC/USDT", "ETH/BTC",  "ETH/USDT"),
     ("BTC/USDT", "BNB/BTC",  "BNB/USDT"),
@@ -19,7 +20,39 @@ TRIANGLES = [
     ("ETH/USDT", "SOL/ETH",  "SOL/USDT"),
 ]
 
+# ─────────────────────────────────────────────
+#  Shared state (thread-safe via lock)
+# ─────────────────────────────────────────────
+_lock        = threading.Lock()
+_scanner_on  = False
+_scanner_thread = None
+_last_scan   = []          # latest scan results
+_scan_log    = []          # rolling log of events (max 50)
+_trade_size  = 100.0       # USDT per arb trade
+_total_profit = 0.0
+_trades_executed = 0
 
+
+def get_state():
+    with _lock:
+        return {
+            "running":         _scanner_on,
+            "last_scan":       list(_last_scan),
+            "scan_log":        list(_scan_log),
+            "trade_size":      _trade_size,
+            "total_profit":    _total_profit,
+            "trades_executed": _trades_executed,
+        }
+
+def set_trade_size(size: float):
+    global _trade_size
+    with _lock:
+        _trade_size = size
+
+
+# ─────────────────────────────────────────────
+#  Exchange
+# ─────────────────────────────────────────────
 def get_exchange():
     exchange = ccxt.binance({
         "apiKey": API_KEY,
@@ -32,7 +65,6 @@ def get_exchange():
 
 
 def fetch_order_book_prices(exchange, symbol: str):
-    """Returns best bid and ask for a symbol"""
     try:
         ob  = exchange.fetch_order_book(symbol, limit=5)
         bid = ob["bids"][0][0] if ob["bids"] else None
@@ -42,27 +74,23 @@ def fetch_order_book_prices(exchange, symbol: str):
         return None, None
 
 
+# ─────────────────────────────────────────────
+#  Triangle calc
+# ─────────────────────────────────────────────
 def calc_triangle_profit(exchange, triangle: tuple) -> dict:
-    """
-    Simulate: USDT → coin1 → coin2 → USDT
-    Returns profit % and details
-    """
     pair1, pair2, pair3 = triangle
-    start_usdt = 1000.0  # simulate with $1000
+    start_usdt = 1000.0
 
-    # Leg 1: Buy coin1 with USDT  (pair1 = coin1/USDT)
     _, ask1 = fetch_order_book_prices(exchange, pair1)
     if not ask1:
         return {"profitable": False, "error": f"No price for {pair1}"}
     coin1_amount = (start_usdt / ask1) * (1 - TRADE_FEE)
 
-    # Leg 2: Buy coin2 with coin1  (pair2 = coin2/coin1)
     _, ask2 = fetch_order_book_prices(exchange, pair2)
     if not ask2:
         return {"profitable": False, "error": f"No price for {pair2}"}
     coin2_amount = (coin1_amount / ask2) * (1 - TRADE_FEE)
 
-    # Leg 3: Sell coin2 for USDT  (pair3 = coin2/USDT)
     bid3, _ = fetch_order_book_prices(exchange, pair3)
     if not bid3:
         return {"profitable": False, "error": f"No price for {pair3}"}
@@ -72,12 +100,12 @@ def calc_triangle_profit(exchange, triangle: tuple) -> dict:
     profit_abs = end_usdt - start_usdt
 
     return {
-        "triangle":    f"{pair1} → {pair2} → {pair3}",
-        "start_usdt":  round(start_usdt, 2),
-        "end_usdt":    round(end_usdt, 2),
-        "profit_pct":  round(profit_pct, 4),
-        "profit_abs":  round(profit_abs, 4),
-        "profitable":  profit_pct > 0.1,  # only flag if > 0.1% after fees
+        "triangle":   f"{pair1} → {pair2} → {pair3}",
+        "start_usdt": round(start_usdt, 2),
+        "end_usdt":   round(end_usdt, 2),
+        "profit_pct": round(profit_pct, 4),
+        "profit_abs": round(profit_abs, 4),
+        "profitable": profit_pct > MIN_PROFIT_PCT,
         "prices": {
             pair1: round(ask1, 6),
             pair2: round(ask2, 6),
@@ -88,22 +116,21 @@ def calc_triangle_profit(exchange, triangle: tuple) -> dict:
 
 
 def scan_all_triangles() -> list:
-    """Scan all triangles and return results sorted by profit"""
     exchange = get_exchange()
     results  = []
     for triangle in TRIANGLES:
         result = calc_triangle_profit(exchange, triangle)
         if "error" not in result:
             results.append(result)
-        time.sleep(0.1)  # be gentle with the API
+        time.sleep(0.1)
     return sorted(results, key=lambda x: x.get("profit_pct", -999), reverse=True)
 
 
+# ─────────────────────────────────────────────
+#  Execute paper arb
+# ─────────────────────────────────────────────
 def execute_paper_arb(triangle_result: dict, trade_size_usdt: float = 100.0) -> dict:
-    """
-    Simulate executing an arbitrage trade on paper
-    Records all 3 legs as trades in the database
-    """
+    global _total_profit, _trades_executed
     session = get_session()
     try:
         profit = (triangle_result["profit_pct"] / 100) * trade_size_usdt
@@ -113,19 +140,24 @@ def execute_paper_arb(triangle_result: dict, trade_size_usdt: float = 100.0) -> 
             leg_trade = Trade(
                 symbol   = pair,
                 side     = "buy" if i < 2 else "sell",
-                amount   = trade_size_usdt / 100,  # normalized
+                amount   = trade_size_usdt / 100,
                 price    = list(triangle_result["prices"].values())[i],
                 strategy = "Triangular Arbitrage",
                 mode     = TRADING_MODE,
-                pnl      = profit if i == 2 else 0.0,
+                pnl      = round(profit, 6) if i == 2 else 0.0,
                 closed   = True,
             )
             session.add(leg_trade)
 
         session.commit()
+
+        with _lock:
+            _total_profit    += profit
+            _trades_executed += 1
+
         return {
             "success":    True,
-            "profit":     round(profit, 4),
+            "profit":     round(profit, 6),
             "trade_size": trade_size_usdt,
             "triangle":   triangle_result["triangle"],
         }
@@ -133,3 +165,75 @@ def execute_paper_arb(triangle_result: dict, trade_size_usdt: float = 100.0) -> 
         return {"success": False, "error": str(e)}
     finally:
         session.close()
+
+
+# ─────────────────────────────────────────────
+#  Auto-scanner loop (runs in background thread)
+# ─────────────────────────────────────────────
+def _scanner_loop():
+    global _scanner_on, _last_scan, _scan_log
+
+    def log(msg):
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        entry = f"[{ts}] {msg}"
+        with _lock:
+            _scan_log.append(entry)
+            if len(_scan_log) > 50:
+                _scan_log.pop(0)
+
+    log("🟢 Auto-scanner started")
+
+    while True:
+        with _lock:
+            if not _scanner_on:
+                break
+            size = _trade_size
+
+        try:
+            results = scan_all_triangles()
+            with _lock:
+                _last_scan.clear()
+                _last_scan.extend(results)
+
+            best = results[0] if results else None
+
+            if best and best.get("profitable"):
+                log(f"✅ Opportunity: {best['triangle']} | {best['profit_pct']:+.4f}%")
+                result = execute_paper_arb(best, trade_size_usdt=size)
+                if result["success"]:
+                    log(f"⚡ Executed! Profit: ${result['profit']:+.6f}")
+                else:
+                    log(f"❌ Execute failed: {result.get('error')}")
+            else:
+                best_pct = best["profit_pct"] if best else 0
+                log(f"➖ No opportunity (best: {best_pct:+.4f}%)")
+
+        except Exception as e:
+            log(f"⚠️ Scan error: {str(e)[:60]}")
+
+        # Wait SCAN_INTERVAL seconds, but check stop signal every second
+        for _ in range(SCAN_INTERVAL):
+            with _lock:
+                if not _scanner_on:
+                    break
+            time.sleep(1)
+
+    log("🔴 Auto-scanner stopped")
+
+
+def start_scanner():
+    global _scanner_on, _scanner_thread
+    with _lock:
+        if _scanner_on:
+            return False
+        _scanner_on = True
+    _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True)
+    _scanner_thread.start()
+    return True
+
+
+def stop_scanner():
+    global _scanner_on
+    with _lock:
+        _scanner_on = False
+    return True
