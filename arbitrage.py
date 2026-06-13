@@ -1,7 +1,7 @@
 import time
 import ccxt
 from datetime import datetime
-from database import get_session, Trade, DailyStats, init_db, get_paper_balance
+from database import get_session, Trade, DailyStats, init_db
 import os
 
 TRADING_MODE  = os.getenv("TRADING_MODE", "paper")
