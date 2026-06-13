@@ -6,382 +6,543 @@ from datetime import datetime
 import os
 
 from database import init_db, get_session, Trade, Position, DailyStats
-from bot import fetch_all_tickers, fetch_ohlcv, TradingBot, SUPPORTED_PAIRS, TRADING_MODE, get_paper_balance
-from strategies import STRATEGIES
-from arbitrage import scan_all_triangles, execute_paper_arb
+from bot import TRADING_MODE, get_paper_balance
+from arbitrage import scan_all_triangles, execute_paper_arb, start_scanner, stop_scanner, get_state, set_trade_size
 
 # ─────────────────────────────────────────────
 #  Page Config
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Crypto Trading Bot",
-    page_icon="📈",
+    page_title="ARB Terminal",
+    page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ─────────────────────────────────────────────
-#  Custom CSS
+#  CSS — terminal style matching reference
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-    .stApp { background-color: #0d1117; color: #e6edf3; }
-    .metric-card {
-        background: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 16px 20px;
-        margin-bottom: 8px;
-    }
-    .metric-label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
-    .metric-value { font-size: 28px; font-weight: 700; color: #e6edf3; }
-    .metric-sub   { font-size: 13px; color: #8b949e; margin-top: 2px; }
-    .green { color: #3fb950; }
-    .red   { color: #f85149; }
-    .mode-badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 600;
-        background: #1f6feb;
-        color: white;
-    }
-    div[data-testid="stMetricValue"] { font-size: 24px !important; }
-    .stTabs [data-baseweb="tab"] { color: #8b949e; }
-    .stTabs [aria-selected="true"] { color: #e6edf3; border-bottom: 2px solid #1f6feb; }
-    .stDataFrame { background: #161b22; }
-    thead tr th { background: #161b22 !important; }
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+html, body, [class*="css"], .stApp {
+    background-color: #0c0c0c !important;
+    color: #d4d4d4 !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+}
+
+/* Hide streamlit chrome */
+#MainMenu, footer, header, .stDeployButton { display: none !important; }
+.block-container { padding: 0 !important; max-width: 100% !important; }
+section[data-testid="stSidebar"] { display: none !important; }
+
+/* ── Top nav bar ── */
+.topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    background: #111;
+    border-bottom: 1px solid #222;
+}
+.topbar-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: #f0f0f0;
+    letter-spacing: 0.05em;
+}
+.live-badge {
+    background: #e8722a;
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 3px;
+    letter-spacing: 0.08em;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.paper-badge {
+    background: #2a6be8;
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 3px;
+    letter-spacing: 0.08em;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.topbar-time {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #666;
+    margin-left: 4px;
+}
+.topbar-right {
+    margin-left: auto;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+.nav-link {
+    font-size: 12px;
+    color: #666;
+    cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace;
+}
+
+/* ── Stat cards ── */
+.stat-card {
+    background: #141414;
+    border: 1px solid #1f1f1f;
+    border-radius: 4px;
+    padding: 14px 16px;
+}
+.stat-label {
+    font-size: 10px;
+    font-weight: 500;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-family: 'IBM Plex Mono', monospace;
+    margin-bottom: 6px;
+}
+.stat-value {
+    font-size: 22px;
+    font-weight: 600;
+    color: #f0f0f0;
+    font-family: 'IBM Plex Mono', monospace;
+    line-height: 1.1;
+}
+.stat-sub {
+    font-size: 11px;
+    color: #555;
+    margin-top: 4px;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.stat-value.green { color: #4eca7e; }
+.stat-value.red   { color: #e85454; }
+.stat-value.orange { color: #e8722a; }
+
+/* ── Panel ── */
+.panel {
+    background: #111;
+    border: 1px solid #1f1f1f;
+    border-radius: 4px;
+    padding: 0;
+    margin-bottom: 12px;
+}
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid #1f1f1f;
+}
+.panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.panel-body { padding: 14px 16px; }
+
+/* ── Triangle rows ── */
+.tri-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid #1a1a1a;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+}
+.tri-row:last-child { border-bottom: none; }
+.tri-name { color: #aaa; flex: 1; }
+.tri-pct { font-weight: 600; min-width: 70px; text-align: right; }
+.tri-pct.pos { color: #4eca7e; }
+.tri-pct.neg { color: #e85454; }
+.tri-pct.neutral { color: #666; }
+.tri-time { color: #444; font-size: 10px; margin-left: 12px; }
+
+/* ── Log ── */
+.log-container {
+    background: #0c0c0c;
+    border: 1px solid #1a1a1a;
+    border-radius: 3px;
+    padding: 10px 12px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #666;
+    max-height: 280px;
+    overflow-y: auto;
+    line-height: 1.8;
+}
+.log-line.profit { color: #4eca7e; }
+.log-line.exec   { color: #e8722a; }
+.log-line.error  { color: #e85454; }
+.log-line.info   { color: #555; }
+.log-line.start  { color: #4e8eca; }
+
+/* ── Trade table ── */
+.trade-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+}
+.trade-table th {
+    text-align: left;
+    color: #444;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 6px 8px;
+    border-bottom: 1px solid #1a1a1a;
+    font-weight: 500;
+}
+.trade-table td {
+    padding: 7px 8px;
+    color: #999;
+    border-bottom: 1px solid #161616;
+}
+.trade-table tr:last-child td { border-bottom: none; }
+.trade-table td.symbol { color: #d4d4d4; font-weight: 500; }
+.trade-table td.profit-pos { color: #4eca7e; }
+.trade-table td.profit-neg { color: #e85454; }
+
+/* ── Scanner button ── */
+.stButton > button {
+    background: #1a1a1a !important;
+    color: #d4d4d4 !important;
+    border: 1px solid #2a2a2a !important;
+    border-radius: 3px !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 12px !important;
+    padding: 6px 16px !important;
+    transition: all 0.15s !important;
+}
+.stButton > button:hover {
+    background: #222 !important;
+    border-color: #e8722a !important;
+    color: #e8722a !important;
+}
+.stButton > button[kind="primary"] {
+    background: #e8722a !important;
+    color: #fff !important;
+    border-color: #e8722a !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background: #d4651f !important;
+}
+
+/* ── Number input ── */
+.stNumberInput input {
+    background: #141414 !important;
+    border: 1px solid #222 !important;
+    color: #d4d4d4 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 12px !important;
+    border-radius: 3px !important;
+}
+
+/* ── Plotly chart bg ── */
+.js-plotly-plot { border-radius: 4px; }
+
+/* ── Divider ── */
+hr { border-color: #1a1a1a !important; }
+
+/* Override streamlit metric */
+div[data-testid="metric-container"] {
+    background: #141414;
+    border: 1px solid #1f1f1f;
+    border-radius: 4px;
+    padding: 12px 16px;
+}
+div[data-testid="stMetricLabel"] p {
+    font-size: 10px !important;
+    color: #555 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-family: 'IBM Plex Mono', monospace !important;
+}
+div[data-testid="stMetricValue"] {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 20px !important;
+    color: #f0f0f0 !important;
+}
+div[data-testid="stMetricDelta"] {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 11px !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 init_db()
-
-# ─────────────────────────────────────────────
-#  Sidebar
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚙️ Bot Controls")
-    mode_label = "🟡 PAPER" if TRADING_MODE == "paper" else "🟢 LIVE"
-    st.markdown(f"**Mode:** {mode_label}")
-    st.divider()
-
-    st.markdown("### Run a Strategy")
-    selected_symbol   = st.selectbox("Asset", SUPPORTED_PAIRS)
-    selected_strategy = st.selectbox("Strategy", list(STRATEGIES.keys()))
-    selected_timeframe = st.selectbox("Timeframe", ["1m", "3m", "15m", "1h", "4h", "1d"])
-
-    if st.button("▶ Run Once", use_container_width=True, type="primary"):
-        with st.spinner("Running strategy..."):
-            bot    = TradingBot(selected_strategy, selected_symbol, selected_timeframe)
-            result = bot.run_once()
-        action = result.get("action", "hold")
-        if action == "buy":
-            st.success(f"✅ BUY signal executed at ${result.get('price', 0):,.2f}")
-        elif action == "sell":
-            pnl = result.get("pnl", 0)
-            color = "🟢" if pnl >= 0 else "🔴"
-            st.info(f"{color} SELL executed | PnL: ${pnl:+.2f} ({result.get('reason','')})")
-        elif action == "blocked":
-            st.warning(f"⛔ {result.get('reason')}")
-        else:
-            st.info(f"⏸ Hold — no signal ({result.get('reason', 'waiting for signal')})")
-
-    st.divider()
-    st.markdown("### Risk Settings")
-    st.caption("Configured via environment variables on Render")
-    st.code(f"""MAX_DAILY_LOSS_PCT = {os.getenv('MAX_DAILY_LOSS_PCT', '5.0')}%
-PAPER_BALANCE = ${os.getenv('PAPER_BALANCE', '10000')}
-TRADING_MODE = {TRADING_MODE}""")
-
-    if st.button("🔄 Refresh Dashboard", use_container_width=True):
-        st.rerun()
-
-# ─────────────────────────────────────────────
-#  Main Content
-# ─────────────────────────────────────────────
-st.markdown("# 📈 Crypto Trading Dashboard")
-st.markdown(f"*{TRADING_MODE.upper()} MODE — Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC*")
-st.divider()
-
 session = get_session()
-prices  = fetch_all_tickers()
+state   = get_state()
+now     = datetime.utcnow()
 
 # ─────────────────────────────────────────────
-#  Top Metrics Row
+#  Top nav bar
 # ─────────────────────────────────────────────
-paper_balance = get_paper_balance(session)
-trades        = session.query(Trade).all()
-open_positions = session.query(Position).all()
-closed_trades  = [t for t in trades if t.closed]
-total_pnl      = sum(t.pnl for t in closed_trades)
-win_trades     = [t for t in closed_trades if t.pnl > 0]
-win_rate       = (len(win_trades) / len(closed_trades) * 100) if closed_trades else 0
+mode_badge = f'<span class="live-badge">{"LIVE" if TRADING_MODE == "live" else "PAPER"}</span>'
+st.markdown(f"""
+<div class="topbar">
+    <span class="topbar-title">⚡ ARB TERMINAL</span>
+    {mode_badge}
+    <span class="topbar-time">{now.strftime("%H:%M")} UTC</span>
+    <div class="topbar-right">
+        <span class="nav-link">Arbitrage</span>
+        <span class="nav-link">History</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-# Unrealized PnL from open positions
-unrealized_pnl = 0
-for pos in open_positions:
-    current_price = prices.get(pos.symbol, pos.entry_price) or pos.entry_price
-    unrealized_pnl += (current_price - pos.entry_price) * pos.amount
-
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    st.metric("💰 Balance", f"${paper_balance:,.2f}", help="Available USDT balance")
-with col2:
-    color = "normal" if total_pnl >= 0 else "inverse"
-    st.metric("📊 Realized PnL", f"${total_pnl:+,.2f}")
-with col3:
-    st.metric("⚡ Unrealized PnL", f"${unrealized_pnl:+,.2f}")
-with col4:
-    st.metric("🏆 Win Rate", f"{win_rate:.1f}%", f"{len(win_trades)}/{len(closed_trades)} trades")
-with col5:
-    st.metric("📂 Open Positions", len(open_positions))
-
-st.divider()
+st.markdown("<div style='padding: 16px 20px 0'>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-#  Tabs
+#  Top stat row
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📡 Live Prices", "📂 Open Positions", "📜 Trade History", "📊 Performance", "🔁 Arbitrage"])
+arb_trades  = session.query(Trade).filter_by(strategy="Triangular Arbitrage", closed=True).all()
+total_pnl   = sum(t.pnl for t in arb_trades)
+wins        = sum(1 for t in arb_trades if t.pnl > 0)
+win_rate    = (wins / len(arb_trades) * 100) if arb_trades else 0
+balance     = get_paper_balance(session)
 
-# ── Tab 1: Live Prices ──────────────────────
-with tab1:
-    st.markdown("### Live Market Prices")
-    price_cols = st.columns(len(SUPPORTED_PAIRS))
-    for i, symbol in enumerate(SUPPORTED_PAIRS):
-        price = prices.get(symbol)
-        with price_cols[i]:
-            if price:
-                st.metric(symbol, f"${price:,.4f}")
-            else:
-                st.metric(symbol, "—")
+pnl_color   = "green" if total_pnl >= 0 else "red"
+scan_status = "🟢 SCANNING" if state["running"] else "🔴 STOPPED"
 
-    st.divider()
-    st.markdown("### Price Chart")
-    chart_symbol    = st.selectbox("Select asset", SUPPORTED_PAIRS, key="chart_symbol")
-    chart_timeframe = st.selectbox("Timeframe", ["1m", "3m", "15m", "1h", "4h", "1d"], key="chart_tf")
+c1, c2, c3, c4, c5 = st.columns(5)
+with c1:
+    st.markdown(f"""<div class="stat-card">
+        <div class="stat-label">Balance</div>
+        <div class="stat-value">${balance:,.2f}</div>
+        <div class="stat-sub">USDT available</div>
+    </div>""", unsafe_allow_html=True)
+with c2:
+    st.markdown(f"""<div class="stat-card">
+        <div class="stat-label">Total PnL</div>
+        <div class="stat-value {pnl_color}">${total_pnl:+.4f}</div>
+        <div class="stat-sub">realized</div>
+    </div>""", unsafe_allow_html=True)
+with c3:
+    st.markdown(f"""<div class="stat-card">
+        <div class="stat-label">Trades</div>
+        <div class="stat-value">{state['trades_executed']}</div>
+        <div class="stat-sub">executed</div>
+    </div>""", unsafe_allow_html=True)
+with c4:
+    st.markdown(f"""<div class="stat-card">
+        <div class="stat-label">Win Rate</div>
+        <div class="stat-value {'green' if win_rate >= 50 else 'red'}">{win_rate:.1f}%</div>
+        <div class="stat-sub">{wins} wins</div>
+    </div>""", unsafe_allow_html=True)
+with c5:
+    st.markdown(f"""<div class="stat-card">
+        <div class="stat-label">Scanner</div>
+        <div class="stat-value orange" style="font-size:14px;padding-top:4px">{scan_status}</div>
+        <div class="stat-sub">10s interval</div>
+    </div>""", unsafe_allow_html=True)
 
-    with st.spinner("Loading chart..."):
-        try:
-            df = fetch_ohlcv(chart_symbol, chart_timeframe, limit=100)
-            fig = go.Figure(data=[go.Candlestick(
-                x=df["timestamp"],
-                open=df["open"], high=df["high"],
-                low=df["low"],   close=df["close"],
-                increasing_line_color="#3fb950",
-                decreasing_line_color="#f85149",
-            )])
-            fig.update_layout(
-                paper_bgcolor="#0d1117",
-                plot_bgcolor="#161b22",
-                font_color="#e6edf3",
-                xaxis_rangeslider_visible=False,
-                margin=dict(l=0, r=0, t=30, b=0),
-                height=450,
-                title=f"{chart_symbol} — {chart_timeframe}",
-            )
-            fig.update_xaxes(gridcolor="#30363d")
-            fig.update_yaxes(gridcolor="#30363d")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.error(f"Chart error: {e}")
+st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
-# ── Tab 2: Open Positions ──────────────────
-with tab2:
-    st.markdown("### Open Positions")
-    if not open_positions:
-        st.info("No open positions. Run a strategy from the sidebar to start trading.")
+# ─────────────────────────────────────────────
+#  Main layout: left (scanner) | right (log)
+# ─────────────────────────────────────────────
+col_left, col_right = st.columns([3, 2])
+
+with col_left:
+    # ── Scanner controls ──
+    st.markdown('<div class="panel-header" style="background:#111;border:1px solid #1f1f1f;border-radius:4px 4px 0 0;margin-bottom:0">'
+                '<span class="panel-title">🔁 Triangle Scanner</span></div>', unsafe_allow_html=True)
+
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 2])
+    with ctrl1:
+        trade_size = st.number_input("Trade size (USDT)", min_value=10.0, max_value=10000.0,
+                                      value=float(state["trade_size"]), step=10.0, label_visibility="collapsed")
+        set_trade_size(trade_size)
+        st.caption(f"Trade size: ${trade_size:.0f} USDT")
+    with ctrl2:
+        if state["running"]:
+            if st.button("⏹ Stop Scanner", use_container_width=True):
+                stop_scanner()
+                st.rerun()
+        else:
+            if st.button("▶ Start Scanner", use_container_width=True, type="primary"):
+                start_scanner()
+                st.rerun()
+    with ctrl3:
+        if st.button("🔍 Scan Once", use_container_width=True):
+            with st.spinner(""):
+                results = scan_all_triangles()
+            st.rerun()
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── Last scan results ──
+    last_scan = state["last_scan"]
+    if not last_scan:
+        st.markdown("""<div class="panel-body" style="background:#111;border:1px solid #1f1f1f;border-radius:4px">
+            <div style="color:#444;font-family:'IBM Plex Mono',monospace;font-size:12px;padding:20px 0;text-align:center">
+            No scan data yet — start the scanner or click Scan Once
+            </div></div>""", unsafe_allow_html=True)
     else:
-        rows = []
-        for pos in open_positions:
-            current = prices.get(pos.symbol, pos.entry_price) or pos.entry_price
-            pnl     = (current - pos.entry_price) * pos.amount
-            pnl_pct = ((current - pos.entry_price) / pos.entry_price) * 100
-            rows.append({
-                "Symbol":        pos.symbol,
-                "Strategy":      pos.strategy,
-                "Entry Price":   f"${pos.entry_price:,.4f}",
-                "Current Price": f"${current:,.4f}",
-                "Amount":        round(pos.amount, 6),
-                "Stop Loss":     f"${pos.stop_loss:,.4f}",
-                "Take Profit":   f"${pos.take_profit:,.4f}",
-                "PnL":           f"${pnl:+.2f}",
-                "PnL %":         f"{pnl_pct:+.2f}%",
-                "Opened":        pos.opened_at.strftime("%Y-%m-%d %H:%M") if pos.opened_at else "—",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        rows_html = ""
+        for r in last_scan:
+            pct = r.get("profit_pct", 0)
+            tri = r.get("triangle", "").replace(" → ", " › ")
+            ts  = r.get("timestamp", "")
+            est = abs(pct / 100) * trade_size
+            pct_class = "pos" if pct > 0.1 else ("neutral" if pct > 0 else "neg")
+            indicator = "✦" if pct > 0.1 else "·"
+            rows_html += f"""<div class="tri-row">
+                <span style="color:#e8722a;margin-right:8px">{indicator}</span>
+                <span class="tri-name">{tri}</span>
+                <span class="tri-pct {pct_class}">{pct:+.4f}%</span>
+                <span style="color:#4eca7e;font-family:'IBM Plex Mono',monospace;font-size:11px;margin-left:12px">
+                    {'≈ $'+f'{est:.4f}' if pct > 0.1 else ''}</span>
+                <span class="tri-time">{ts}</span>
+            </div>"""
 
-# ── Tab 3: Trade History ───────────────────
-with tab3:
-    st.markdown("### Trade History")
-    if not closed_trades:
-        st.info("No closed trades yet.")
-    else:
-        rows = []
-        for t in sorted(closed_trades, key=lambda x: x.timestamp, reverse=True):
-            rows.append({
-                "Time":     t.timestamp.strftime("%Y-%m-%d %H:%M") if t.timestamp else "—",
-                "Symbol":   t.symbol,
-                "Side":     t.side.upper(),
-                "Amount":   round(t.amount, 6),
-                "Price":    f"${t.price:,.4f}",
-                "PnL":      f"${t.pnl:+.2f}",
-                "Strategy": t.strategy,
-                "Mode":     t.mode.upper(),
-            })
-        df_trades = pd.DataFrame(rows)
-        st.dataframe(df_trades, use_container_width=True, hide_index=True)
+        st.markdown(f"""<div style="background:#111;border:1px solid #1f1f1f;border-radius:4px;padding:4px 16px">
+            {rows_html}
+        </div>""", unsafe_allow_html=True)
 
-        # PnL over time
-        if len(closed_trades) > 1:
-            st.markdown("#### Cumulative PnL")
-            sorted_trades = sorted(closed_trades, key=lambda x: x.timestamp)
-            cum_pnl = []
-            running = 0
-            for t in sorted_trades:
-                running += t.pnl
-                cum_pnl.append({"Time": t.timestamp, "Cumulative PnL": running})
-            fig2 = px.line(pd.DataFrame(cum_pnl), x="Time", y="Cumulative PnL",
-                           color_discrete_sequence=["#1f6feb"])
-            fig2.update_layout(
-                paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
-                font_color="#e6edf3", height=300,
-                margin=dict(l=0, r=0, t=20, b=0),
-            )
-            fig2.update_xaxes(gridcolor="#30363d")
-            fig2.update_yaxes(gridcolor="#30363d")
-            st.plotly_chart(fig2, use_container_width=True)
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
-# ── Tab 4: Performance ─────────────────────
-with tab4:
-    st.markdown("### Strategy Performance")
-    all_closed = session.query(Trade).filter_by(closed=True).all()
+    # ── PnL Chart ──
+    closing_trades = [t for t in arb_trades if t.pnl != 0]
+    if len(closing_trades) > 1:
+        st.markdown('<div class="panel-title" style="margin-bottom:8px">CUMULATIVE PnL</div>', unsafe_allow_html=True)
+        sorted_t = sorted(closing_trades, key=lambda x: x.timestamp)
+        running, times, vals = 0, [], []
+        for t in sorted_t:
+            running += t.pnl
+            times.append(t.timestamp)
+            vals.append(running)
 
-    if not all_closed:
-        st.info("No closed trades to analyze yet.")
-    else:
-        # Group by strategy
-        strat_stats = {}
-        for t in all_closed:
-            s = t.strategy
-            if s not in strat_stats:
-                strat_stats[s] = {"trades": 0, "wins": 0, "pnl": 0.0}
-            strat_stats[s]["trades"] += 1
-            strat_stats[s]["pnl"]    += t.pnl
-            if t.pnl > 0:
-                strat_stats[s]["wins"] += 1
-
-        rows = []
-        for strat, data in strat_stats.items():
-            wr = (data["wins"] / data["trades"] * 100) if data["trades"] > 0 else 0
-            rows.append({
-                "Strategy":   strat,
-                "Trades":     data["trades"],
-                "Wins":       data["wins"],
-                "Win Rate":   f"{wr:.1f}%",
-                "Total PnL":  f"${data['pnl']:+.2f}",
-                "Avg PnL":    f"${data['pnl']/data['trades']:+.2f}",
-            })
-
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        # PnL by strategy bar chart
-        fig3 = px.bar(
-            pd.DataFrame([{"Strategy": k, "PnL": v["pnl"]} for k, v in strat_stats.items()]),
-            x="Strategy", y="PnL", color="PnL",
-            color_continuous_scale=["#f85149", "#3fb950"],
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=times, y=vals, mode="lines",
+            line=dict(color="#e8722a", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(232,114,42,0.08)",
+        ))
+        fig.update_layout(
+            paper_bgcolor="#111", plot_bgcolor="#111",
+            font=dict(color="#555", family="IBM Plex Mono", size=10),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=160,
+            xaxis=dict(gridcolor="#1a1a1a", showline=False, zeroline=False),
+            yaxis=dict(gridcolor="#1a1a1a", showline=False, zeroline=False),
+            showlegend=False,
         )
-        fig3.update_layout(
-            paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
-            font_color="#e6edf3", height=300,
-            margin=dict(l=0, r=0, t=20, b=0),
-            coloraxis_showscale=False,
-        )
-        fig3.update_xaxes(gridcolor="#30363d")
-        fig3.update_yaxes(gridcolor="#30363d")
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-        # Daily stats
-        st.markdown("### Daily Summary")
-        daily = session.query(DailyStats).all()
-        if daily:
-            rows2 = []
-            for d in sorted(daily, key=lambda x: x.date, reverse=True):
-                wr = (d.wins / (d.wins + d.losses) * 100) if (d.wins + d.losses) > 0 else 0
-                rows2.append({
-                    "Date":          d.date,
-                    "Starting Bal":  f"${d.starting_balance:,.2f}",
-                    "Realized PnL":  f"${d.realized_pnl:+.2f}",
-                    "Trades":        d.trades_count,
-                    "Win Rate":      f"{wr:.1f}%",
-                })
-            st.dataframe(pd.DataFrame(rows2), use_container_width=True, hide_index=True)
+with col_right:
+    # ── Activity log ──
+    st.markdown('<div class="panel-header" style="background:#111;border:1px solid #1f1f1f;border-radius:4px 4px 0 0">'
+                '<span class="panel-title">📋 Activity Log</span>'
+                f'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;color:#444">'
+                f'last {min(len(state["scan_log"]),20)} events</span></div>', unsafe_allow_html=True)
 
-# ── Tab 5: Arbitrage ──────────────────────
-with tab5:
-    st.markdown("### 🔁 Triangular Arbitrage Scanner")
-    st.caption("Scans BTC/ETH/BNB/SOL triangles on Binance for profit opportunities after fees (0.3% total)")
-
-    col_scan, col_size = st.columns([2, 1])
-    with col_size:
-        trade_size = st.number_input("Trade size (USDT)", min_value=10.0, max_value=10000.0, value=100.0, step=10.0)
-    with col_scan:
-        scan_clicked = st.button("🔍 Scan Now", type="primary", use_container_width=True)
-
-    if scan_clicked:
-        with st.spinner("Scanning all triangles... this takes ~5 seconds"):
-            results = scan_all_triangles()
-
-        st.markdown("#### Scan Results")
-        for r in results:
-            profit_pct = r.get("profit_pct", 0)
-            triangle   = r.get("triangle", "")
-            profit_abs = r.get("profit_abs", 0) * (trade_size / 1000)
-            is_profit  = r.get("profitable", False)
-
-            if is_profit:
-                st.success(f"✅ **{triangle}** | Profit: **{profit_pct:+.4f}%** (≈ ${profit_abs:+.4f} on ${trade_size})")
-            else:
-                st.info(f"➖ {triangle} | {profit_pct:+.4f}%")
-
-        # Show best opportunity
-        best = results[0] if results else None
-        if best and best.get("profitable"):
-            st.divider()
-            st.markdown("#### 🎯 Best Opportunity")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Triangle",   best["triangle"].split(" → ")[0] + " →...")
-            c2.metric("Profit %",   f"{best['profit_pct']:+.4f}%")
-            c3.metric("Est. Profit", f"${(best['profit_abs'] * trade_size / 1000):+.4f}")
-
-            st.markdown("**Prices used:**")
-            for pair, price in best["prices"].items():
-                st.code(f"{pair}: {price}")
-
-            if st.button("⚡ Execute Paper Trade", type="primary"):
-                exec_result = execute_paper_arb(best, trade_size_usdt=trade_size)
-                if exec_result["success"]:
-                    st.success(f"✅ Paper trade executed! Profit: ${exec_result['profit']:+.4f}")
-                else:
-                    st.error(f"❌ Error: {exec_result.get('error')}")
-        elif results:
-            st.warning("⚠️ No profitable opportunities found right now. Try scanning again in a few seconds.")
-
-    st.divider()
-    st.markdown("#### Recent Arbitrage Trades")
-    arb_trades = session.query(Trade).filter_by(strategy="Triangular Arbitrage").order_by(Trade.timestamp.desc()).limit(20).all()
-    if not arb_trades:
-        st.info("No arbitrage trades executed yet. Run a scan and execute a paper trade above.")
+    log = list(reversed(state["scan_log"][-20:]))
+    if not log:
+        st.markdown("""<div class="log-container" style="border-radius:0 0 4px 4px">
+            <span style="color:#333">— waiting for scanner activity —</span>
+        </div>""", unsafe_allow_html=True)
     else:
-        rows = []
+        lines_html = ""
+        for line in log:
+            if "✅" in line or "Profit" in line:
+                cls = "profit"
+            elif "⚡" in line or "Executed" in line:
+                cls = "exec"
+            elif "❌" in line or "⚠️" in line:
+                cls = "error"
+            elif "🟢" in line or "🔴" in line:
+                cls = "start"
+            else:
+                cls = "info"
+            lines_html += f'<div class="log-line {cls}">{line}</div>'
+        st.markdown(f'<div class="log-container" style="border:1px solid #1a1a1a;border-top:none;border-radius:0 0 4px 4px">{lines_html}</div>',
+                    unsafe_allow_html=True)
+
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    # ── Quick stats panel ──
+    st.markdown('<div class="panel-title" style="margin-bottom:8px">TRIANGLE PERFORMANCE</div>', unsafe_allow_html=True)
+    if arb_trades:
+        # group by symbol (first leg = triangle identifier)
+        from collections import defaultdict
+        tri_stats = defaultdict(lambda: {"trades": 0, "pnl": 0.0})
         for t in arb_trades:
-            rows.append({
-                "Time":    t.timestamp.strftime("%Y-%m-%d %H:%M:%S") if t.timestamp else "—",
-                "Route":   t.symbol,
-                "Side":    t.side.upper(),
-                "PnL":     f"${t.pnl:+.4f}",
-                "Mode":    t.mode.upper(),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            tri_stats[t.symbol]["trades"] += 1
+            tri_stats[t.symbol]["pnl"]    += t.pnl
+
+        rows_html = ""
+        for sym, data in sorted(tri_stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
+            color = "#4eca7e" if data["pnl"] >= 0 else "#e85454"
+            rows_html += f"""<div class="tri-row">
+                <span class="tri-name">{sym}</span>
+                <span style="color:#555;font-family:'IBM Plex Mono',monospace;font-size:11px">{data['trades']}x</span>
+                <span class="tri-pct" style="color:{color}">${data['pnl']:+.4f}</span>
+            </div>"""
+        st.markdown(f'<div style="background:#111;border:1px solid #1f1f1f;border-radius:4px;padding:4px 16px">{rows_html}</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div style="color:#333;font-family:\'IBM Plex Mono\',monospace;font-size:11px;padding:12px 0">No trades yet</div>',
+                    unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+#  Trade History Table
+# ─────────────────────────────────────────────
+st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+st.markdown('<div class="panel-header" style="background:#111;border:1px solid #1f1f1f;border-radius:4px 4px 0 0">'
+            '<span class="panel-title">📜 Trade History</span>'
+            f'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;color:#444">'
+            f'{len(closing_trades)} closed trades</span></div>', unsafe_allow_html=True)
+
+recent = session.query(Trade).filter_by(strategy="Triangular Arbitrage") \
+    .order_by(Trade.timestamp.desc()).limit(50).all()
+
+if not recent:
+    st.markdown("""<div style="background:#111;border:1px solid #1f1f1f;border-top:none;border-radius:0 0 4px 4px;
+        padding:24px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#333">
+        No trades recorded yet — start the scanner to begin
+    </div>""", unsafe_allow_html=True)
+else:
+    rows_html = "".join([
+        f"""<tr>
+            <td style="color:#444">{t.timestamp.strftime('%H:%M:%S') if t.timestamp else '—'}</td>
+            <td class="symbol">{t.symbol}</td>
+            <td style="color:{'#4eca7e' if t.side=='buy' else '#e85454'}">{t.side.upper()}</td>
+            <td>{t.amount:.6f}</td>
+            <td>${t.price:,.6f}</td>
+            <td class="{'profit-pos' if t.pnl > 0 else 'profit-neg' if t.pnl < 0 else ''}">${t.pnl:+.6f}</td>
+            <td style="color:#333">{t.mode.upper()}</td>
+        </tr>"""
+        for t in recent
+    ])
+    st.markdown(f"""<div style="background:#111;border:1px solid #1f1f1f;border-top:none;
+        border-radius:0 0 4px 4px;padding:8px 16px;overflow-x:auto">
+        <table class="trade-table">
+            <thead><tr>
+                <th>TIME</th><th>PAIR</th><th>SIDE</th>
+                <th>AMOUNT</th><th>PRICE</th><th>PnL</th><th>MODE</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>""", unsafe_allow_html=True)
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# Auto-refresh while scanner running
+if state["running"]:
+    st.markdown('<meta http-equiv="refresh" content="12">', unsafe_allow_html=True)
 
 session.close()
